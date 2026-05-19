@@ -110,21 +110,3 @@ Open [http://localhost:8050](http://localhost:8050)
 - Data freshness timestamp
 
 > If `checkpoints/best_model.pt` doesn't exist yet, the dashboard runs in **demo mode** with extrapolated prices — useful for development before training completes.
-
----
-
-## Ethical Considerations
-
-As noted in the research proposal, this model carries two key risks:
-1. **Market manipulation**: A highly accurate model could help large resellers sweep undervalued listings. This tool is intended for independent shop owners and collectors, not arbitrage at scale.
-2. **Geographic bias**: Training data from North American platforms undervalues Japanese/Korean vintage instruments (Fernandes, Greco). Model outputs should be interpreted accordingly.
-
----
-
-## Resume Talking Points
-
-- Built a **multi-modal PyTorch model** fusing DistilBERT text embeddings with structured tabular features for price regression
-- Implemented **Gaussian NLL loss** for uncertainty-aware predictions with calibrated confidence intervals
-- Designed an **NLP preprocessing pipeline** using regex-based keyword extraction to convert unstructured listing text into structured originality scores
-- Deployed an **interactive Plotly Dash dashboard** with dynamic forecasting, Buy/Hold/Sell signals, and currency toggling
-- Applied **differential learning rates** for BERT fine-tuning vs. task-specific heads and gradient clipping for stable training
