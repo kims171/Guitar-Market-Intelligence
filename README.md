@@ -2,7 +2,7 @@
 
 > A multi-modal machine learning pipeline that predicts 6-month price trajectories for vintage electric guitars (1950s–1980s) in the North American secondary market.
 
-Built with **PyTorch**, **DistilBERT**, and **Plotly Dash**.
+Built with **Pythob**, **PyTorch**, **DistilBERT**, and **Plotly Dash**.
 
 ---
 
