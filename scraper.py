@@ -1,171 +1,262 @@
 """
-scraper.py — Reverb.com Sold Listings Scraper
-Collects historical sold guitar listings and saves them to raw_listings.csv
+scraper.py — Reverb Official API Data Collector
+Uses api.reverb.com (no scraping, no bot detection, clean JSON).
+
+SETUP (one-time):
+  1. Create a free Reverb account at reverb.com
+  2. Go to reverb.com/my/account/apps → "Personal Access Tokens"
+  3. Create a token with scope: "Read listings"
+  4. Create a file called .env in this folder and add:
+       REVERB_TOKEN=your_token_here
+  OR just paste your token into REVERB_TOKEN below.
+
+Run:
+    python scraper.py
 """
 
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
+import os
 import time
-import random
 import logging
-from datetime import datetime
 from pathlib import Path
+
+import requests
+import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# CONFIG — paste your token here if you don't want to use .env
 # ---------------------------------------------------------------------------
+REVERB_TOKEN = os.getenv("REVERB_TOKEN", "aa76ffb0b99a37526d766dcc59a59001ccb167d1da580dbd749e6689d31d175e")
 
-BASE_URL = "https://reverb.com/marketplace"
-
+BASE_URL = "https://api.reverb.com/api"
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/hal+json",
+    "Accept": "application/hal+json",
+    "Accept-Version": "3.0",
+    "Authorization": f"Bearer {REVERB_TOKEN}",
 }
 
 TARGET_BRANDS = ["Fender", "Gibson", "Gretsch", "Rickenbacker", "Epiphone"]
-
-# Reverb category slug for electric guitars
-CATEGORY_SLUG = "electric-guitars"
-
+DECADES = ["1950s", "1960s", "1970s", "1980s"]
 OUTPUT_PATH = Path("data/raw_listings.csv")
+PER_PAGE = 50        # Max per page Reverb allows
+MAX_PAGES = 10       # 10 pages × 50 = 500 listings per brand
 
 
 # ---------------------------------------------------------------------------
-# Scraping helpers
+# API helpers
 # ---------------------------------------------------------------------------
 
-def build_search_url(brand: str, page: int = 1) -> str:
-    """Build a Reverb sold-listings search URL for a given brand."""
-    return (
-        f"{BASE_URL}?query={brand}+vintage+electric+guitar"
-        f"&category={CATEGORY_SLUG}"
-        f"&decade%5B%5D=1950s&decade%5B%5D=1960s"
-        f"&decade%5B%5D=1970s&decade%5B%5D=1980s"
-        f"&sold_listings=true"
-        f"&page={page}"
-    )
-
-
-def parse_listing_card(card) -> dict | None:
-    """
-    Extract fields from a single Reverb listing <article> card.
-    Returns None if essential fields are missing.
-    """
+def reverb_get(endpoint: str, params: dict) -> dict | None:
+    """Make a GET request to the Reverb API. Returns JSON or None on failure."""
+    url = f"{BASE_URL}/{endpoint}"
     try:
-        title_el = card.select_one("[data-listing-id] .listing-card__title")
-        price_el = card.select_one(".price-display__price")
-        condition_el = card.select_one(".listing-card__condition")
-        sold_date_el = card.select_one(".listing-card__nudge--sold")
-        link_el = card.select_one("a.listing-card__title")
-
-        if not (title_el and price_el):
-            return None
-
-        price_str = price_el.get_text(strip=True).replace("$", "").replace(",", "")
-        price = float(price_str) if price_str else None
-
-        return {
-            "title": title_el.get_text(strip=True),
-            "price_usd": price,
-            "condition": condition_el.get_text(strip=True) if condition_el else "Unknown",
-            "sold_date": sold_date_el.get_text(strip=True) if sold_date_el else None,
-            "url": "https://reverb.com" + link_el["href"] if link_el else None,
-            "scraped_at": datetime.utcnow().isoformat(),
-        }
-    except Exception as e:
-        logger.debug(f"Failed to parse card: {e}")
-        return None
-
-
-def scrape_listing_description(url: str, session: requests.Session) -> str:
-    """Fetch the full description text from an individual listing page."""
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=10)
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        desc_el = soup.select_one(".listing-description")
-        return desc_el.get_text(separator=" ", strip=True) if desc_el else ""
-    except Exception as e:
-        logger.debug(f"Could not fetch description from {url}: {e}")
-        return ""
+        return resp.json()
+    except requests.HTTPError as e:
+        if resp.status_code == 401:
+            logger.error("401 Unauthorized — check your REVERB_TOKEN in .env")
+        elif resp.status_code == 429:
+            logger.warning("Rate limited — sleeping 60s")
+            time.sleep(60)
+        else:
+            logger.warning(f"HTTP {resp.status_code} for {url}: {e}")
+    except requests.RequestException as e:
+        logger.warning(f"Request failed: {e}")
+    return None
 
 
-def scrape_brand(brand: str, max_pages: int = 5) -> list[dict]:
-    """Scrape sold listings for a single brand across multiple pages."""
-    session = requests.Session()
+def flatten_listing(item: dict, brand: str) -> dict:
+    """
+    Pull the fields we care about from a Reverb listing JSON object.
+    Reverb returns nested dicts — we flatten them into a single row.
+    """
+    price = item.get("price", {})
+    condition = item.get("condition", {})
+    shipping = item.get("shipping", {})
+
+    return {
+        "id":                  item.get("id"),
+        "brand":               brand,
+        "title":               item.get("title", ""),
+        "make":                item.get("make", ""),
+        "model":               item.get("model", ""),
+        "year":                item.get("year", ""),
+        "finish":              item.get("finish", ""),
+        "description":         item.get("description", ""),
+        "price_amount":        price.get("amount"),
+        "price_currency":      price.get("currency", "USD"),
+        "condition":           condition.get("display_name", ""),
+        "condition_slug":      condition.get("slug", ""),
+        "state":               item.get("state"),
+        "has_inventory":       item.get("has_inventory"),
+        "created_at":          item.get("created_at"),
+        "published_at":        item.get("published_at"),
+        "url":                 item.get("_links", {}).get("web", {}).get("href", ""),
+        "photos":              len(item.get("photos", [])),
+        "seller_country":      item.get("seller_country", ""),
+        "shop_name":           item.get("shop", {}).get("name", "") if item.get("shop") else "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Collection logic
+# ---------------------------------------------------------------------------
+
+def collect_brand_decade(brand: str, decade: str, max_pages: int = MAX_PAGES) -> list[dict]:
+    """
+    Fetch sold listings for one brand+decade combination via the Reverb API.
+    Reverb paginates via _links.next.href — we follow that chain.
+    """
     results = []
 
+    params = {
+        "query": f"{brand} vintage electric guitar",
+        "make":  brand,
+        "decade[]": decade,
+        "state": "sold",        # sold listings only
+        "per_page": PER_PAGE,
+        "page": 1,
+    }
+
     for page in range(1, max_pages + 1):
-        url = build_search_url(brand, page)
-        logger.info(f"Scraping {brand} — page {page}: {url}")
+        params["page"] = page
+        logger.info(f"  {brand} / {decade} — page {page}")
+        data = reverb_get("listings", params)
 
-        try:
-            resp = session.get(url, headers=HEADERS, timeout=15)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            logger.warning(f"Request failed: {e}")
+        if data is None:
             break
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        cards = soup.select("article.listing-card")
-
-        if not cards:
-            logger.info(f"No more listings found for {brand} on page {page}.")
+        listings = data.get("listings", [])
+        if not listings:
+            logger.info(f"  No more listings for {brand}/{decade} on page {page}.")
             break
 
-        for card in cards:
-            listing = parse_listing_card(card)
-            if listing is None:
-                continue
+        for item in listings:
+            row = flatten_listing(item, brand)
+            results.append(row)
 
-            # Politely fetch the description from the individual page
-            if listing["url"]:
-                listing["description"] = scrape_listing_description(
-                    listing["url"], session
-                )
-                time.sleep(random.uniform(1.5, 3.0))  # Respectful crawl delay
-            else:
-                listing["description"] = ""
+        # Respectful delay between pages
+        time.sleep(1.0)
 
-            listing["brand"] = brand
-            results.append(listing)
-
-        logger.info(f"  → {len(cards)} cards found, {len(results)} total so far.")
-
-        # Page-level delay
-        time.sleep(random.uniform(2.0, 4.0))
+        # If Reverb says there's no next page, stop
+        links = data.get("_links", {})
+        if "next" not in links:
+            break
 
     return results
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
-def run_scraper(brands: list[str] = TARGET_BRANDS, max_pages: int = 5):
-    """Scrape all target brands and save results to CSV."""
+def collect_all(brands=TARGET_BRANDS, decades=DECADES) -> pd.DataFrame:
+    """Collect sold listings across all brands and decades."""
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    all_listings = []
 
+    if REVERB_TOKEN == "YOUR_TOKEN_HERE":
+        logger.error(
+            "\n\n========================================================\n"
+            "  REVERB_TOKEN not set!\n"
+            "  1. Go to reverb.com → My Account → Apps → Personal Access Tokens\n"
+            "  2. Create a token with 'Read listings' scope\n"
+            "  3. Add REVERB_TOKEN=your_token to a .env file in this folder\n"
+            "========================================================"
+        )
+        return pd.DataFrame()
+
+    all_rows = []
     for brand in brands:
-        brand_listings = scrape_brand(brand, max_pages=max_pages)
-        all_listings.extend(brand_listings)
-        logger.info(f"Finished {brand}: {len(brand_listings)} listings collected.")
+        brand_rows = []
+        for decade in decades:
+            rows = collect_brand_decade(brand, decade)
+            brand_rows.extend(rows)
+            time.sleep(2.0)   # Pause between decade queries
 
-    df = pd.DataFrame(all_listings)
-    df.drop_duplicates(subset=["url"], inplace=True)
+        logger.info(f"Collected {len(brand_rows)} sold listings for {brand}.")
+        all_rows.extend(brand_rows)
+
+    df = pd.DataFrame(all_rows)
+
+    if df.empty:
+        logger.warning("No listings collected. Check your token and try again.")
+        return df
+
+    # Deduplicate by Reverb listing ID
+    df.drop_duplicates(subset=["id"], inplace=True)
+
+    # Convert price to float
+    df["price_usd"] = pd.to_numeric(df["price_amount"], errors="coerce")
+
+    # Rough CAD → USD conversion for any CAD listings
+    cad_mask = df["price_currency"].str.upper() == "CAD"
+    df.loc[cad_mask, "price_usd"] = df.loc[cad_mask, "price_usd"] * 0.74
+
     df.to_csv(OUTPUT_PATH, index=False)
-    logger.info(f"Saved {len(df)} listings to {OUTPUT_PATH}")
+    logger.info(f"Saved {len(df)} listings → {OUTPUT_PATH}")
     return df
 
 
+# ---------------------------------------------------------------------------
+# Also collect active (non-sold) listings for current market context
+# ---------------------------------------------------------------------------
+
+def collect_active_listings(brands=TARGET_BRANDS, decades=DECADES, max_pages=5) -> pd.DataFrame:
+    """
+    Collect currently active (unsold) listings for each brand.
+    Useful as a baseline for the 'current asking price' vs predicted price comparison.
+    """
+    active_path = Path("data/active_listings.csv")
+    all_rows = []
+
+    for brand in brands:
+        for decade in decades:
+            params = {
+                "query":    f"{brand} vintage electric guitar",
+                "make":     brand,
+                "decade[]": decade,
+                "per_page": PER_PAGE,
+                "page":     1,
+            }
+            for page in range(1, max_pages + 1):
+                params["page"] = page
+                data = reverb_get("listings", params)
+                if not data or not data.get("listings"):
+                    break
+                for item in data["listings"]:
+                    row = flatten_listing(item, brand)
+                    all_rows.append(row)
+                time.sleep(1.0)
+                if "next" not in data.get("_links", {}):
+                    break
+            time.sleep(2.0)
+
+    df = pd.DataFrame(all_rows)
+    if not df.empty:
+        df.drop_duplicates(subset=["id"], inplace=True)
+        df["price_usd"] = pd.to_numeric(df["price_amount"], errors="coerce")
+        df.to_csv(active_path, index=False)
+        logger.info(f"Saved {len(df)} active listings → {active_path}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    run_scraper()
+    logger.info("=== Collecting SOLD listings (training data) ===")
+    sold_df = collect_all()
+
+    if not sold_df.empty:
+        logger.info("\n=== Collecting ACTIVE listings (market context) ===")
+        collect_active_listings()
+
+        print(f"\nDone! Summary:")
+        print(f"  Sold listings:  {len(sold_df)}")
+        print(f"  Brands:         {sold_df['brand'].value_counts().to_dict()}")
+        print(f"  Price range:    ${sold_df['price_usd'].min():,.0f} – ${sold_df['price_usd'].max():,.0f}")
+        print(f"\nNext step: python preprocess.py")
